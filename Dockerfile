@@ -11,8 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY import_app.py .
-COPY single_owner_app.py .
 
 EXPOSE 80
 
-CMD ["sh", "-c", "uvicorn single_owner_app:app --host 0.0.0.0 --port ${PORT:-80} --workers 1"]
+CMD ["sh", "-c", "uvicorn import_app:app --host 0.0.0.0 --port ${PORT:-80} --workers 1"]
