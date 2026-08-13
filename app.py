@@ -3,6 +3,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional, Tuple
 
@@ -30,6 +31,10 @@ TG_API_ID = int(os.environ["TG_API_ID"])
 TG_API_HASH = os.environ["TG_API_HASH"]
 TG_SESSION_STRING = os.environ["TG_SESSION_STRING"].strip()
 TG_CHANNEL_ID = int(os.environ["TG_CHANNEL_ID"])
+
+# Separate secret used only for private/admin discovery endpoints.
+# Never expose the Telegram session string for this purpose.
+STRIMA_ADMIN_KEY = os.getenv("STRIMA_ADMIN_KEY", "").strip()
 
 PORT = int(os.getenv("PORT", "80"))
 
@@ -174,7 +179,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="STRIMA Telegram Gateway",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -567,7 +572,7 @@ async def root():
             "Telegram origin -> Bunny CDN",
 
         "version":
-            "0.3.0",
+            "0.4.0",
     }
 
 
@@ -629,6 +634,110 @@ async def health():
                 "telegram":
                     type(exc).__name__,
             },
+        )
+
+
+# ============================================================
+# PRIVATE TELEGRAM CHANNEL DISCOVERY
+#
+# This endpoint is intentionally protected by a separate admin
+# key. It lists channels visible to the authenticated Telegram
+# USER session so we can safely choose an old source channel.
+#
+# Header required:
+# X-STRIMA-Admin-Key: <STRIMA_ADMIN_KEY>
+# ============================================================
+
+@app.get("/admin/telegram/channels")
+async def list_telegram_channels(
+    admin_key: Optional[str] = Header(
+        default=None,
+        alias="X-STRIMA-Admin-Key",
+    ),
+):
+
+    if not STRIMA_ADMIN_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "STRIMA_ADMIN_KEY is not configured on the server"
+            ),
+        )
+
+    if (
+        not admin_key
+        or not secrets.compare_digest(
+            admin_key,
+            STRIMA_ADMIN_KEY,
+        )
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin key",
+        )
+
+    if not client.is_connected():
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram client is disconnected",
+        )
+
+    try:
+        dialogs = await client.get_dialogs()
+
+        channels = []
+
+        for dialog in dialogs:
+            if not getattr(dialog, "is_channel", False):
+                continue
+
+            entity = getattr(dialog, "entity", None)
+
+            channels.append(
+                {
+                    "id": dialog.id,
+                    "title": dialog.title,
+                    "username": getattr(
+                        entity,
+                        "username",
+                        None,
+                    ),
+                    "is_group": bool(
+                        getattr(dialog, "is_group", False)
+                    ),
+                    "is_channel": True,
+                    "is_configured_destination": (
+                        dialog.id == TG_CHANNEL_ID
+                    ),
+                }
+            )
+
+        channels.sort(
+            key=lambda item: (
+                item.get("title") or ""
+            ).lower()
+        )
+
+        return {
+            "ok": True,
+            "count": len(channels),
+            "configured_destination_channel_id": TG_CHANNEL_ID,
+            "channels": channels,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        log.exception(
+            "Failed to list Telegram channels"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Telegram channel discovery failed: "
+                f"{type(exc).__name__}"
+            ),
         )
 
 
