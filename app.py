@@ -9,7 +9,7 @@ from typing import AsyncIterator, Optional, Tuple
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from telethon import TelegramClient
-from telethon.sessions import MemorySession
+from telethon.sessions import StringSession
 
 
 logging.basicConfig(
@@ -28,7 +28,7 @@ log = logging.getLogger("strima-gateway")
 
 TG_API_ID = int(os.environ["TG_API_ID"])
 TG_API_HASH = os.environ["TG_API_HASH"]
-TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
+TG_SESSION_STRING = os.environ["TG_SESSION_STRING"].strip()
 TG_CHANNEL_ID = int(os.environ["TG_CHANNEL_ID"])
 
 PORT = int(os.getenv("PORT", "80"))
@@ -55,7 +55,7 @@ CACHE_SECONDS = int(
 # ============================================================
 
 client = TelegramClient(
-    MemorySession(),
+    StringSession(TG_SESSION_STRING),
     TG_API_ID,
     TG_API_HASH,
     sequential_updates=False,
@@ -90,10 +90,16 @@ async def lifespan(app: FastAPI):
         "Connecting STRIMA Telegram Gateway to Telegram..."
     )
 
-    # Log in using our Telegram bot
-    await client.start(
-        bot_token=TG_BOT_TOKEN
-    )
+    # Connect using the dedicated Telegram USER session stored
+    # securely in Bunny as TG_SESSION_STRING.
+    await client.connect()
+
+    if not await client.is_user_authorized():
+
+        raise RuntimeError(
+            "TG_SESSION_STRING is not authorized. "
+            "Create a new dedicated Telegram user session."
+        )
 
     me = await client.get_me()
 
@@ -112,7 +118,7 @@ async def lifespan(app: FastAPI):
     # Telegram lookup failed: ValueError
     #
     # Loading Telegram dialogs causes Telethon to learn the
-    # access hash for channels visible to our bot.
+    # access hash for channels visible to this Telegram account.
     # --------------------------------------------------------
 
     log.info(
@@ -137,14 +143,15 @@ async def lifespan(app: FastAPI):
             break
 
 
-    # If this happens, the bot cannot currently see the channel.
+    # If this happens, this Telegram account cannot currently
+    # see the configured channel.
     if CHANNEL_INPUT_ENTITY is None:
 
         raise RuntimeError(
             f"Configured Telegram channel "
-            f"{TG_CHANNEL_ID} is not visible to this bot. "
-            f"Confirm the bot is still an administrator "
-            f"or member of the channel."
+            f"{TG_CHANNEL_ID} is not visible to this Telegram account. "
+            f"Confirm the account is still a member "
+            f"of the channel."
         )
 
 
@@ -167,7 +174,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="STRIMA Telegram Gateway",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -560,7 +567,7 @@ async def root():
             "Telegram origin -> Bunny CDN",
 
         "version":
-            "0.2.0",
+            "0.3.0",
     }
 
 
@@ -594,10 +601,10 @@ async def health():
             "telegram":
                 "connected",
 
-            "bot_id":
+            "telegram_user_id":
                 me.id,
 
-            "bot_username":
+            "telegram_username":
                 getattr(
                     me,
                     "username",
