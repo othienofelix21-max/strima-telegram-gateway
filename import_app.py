@@ -74,6 +74,16 @@ def _clean_public_title(item: dict) -> str:
     if year:
         raw = re.sub(rf"\b{int(year)}\b", " ", raw)
 
+    # Remove an explicit VJ label directly from the filename/title. This is more
+    # reliable than depending only on metadata extraction and prevents titles such
+    # as "Helen Of Troy 1 Jr" when the source was "... VJ JR".
+    raw = re.sub(
+        r"\bVJ[\s._-]*[A-Za-z][A-Za-z0-9'-]{1,30}\b",
+        " ",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
     vj_name = str(item.get("detected_vj_name") or "").strip()
     if vj_name:
         raw = re.sub(re.escape(vj_name), " ", raw, flags=re.IGNORECASE)
@@ -116,14 +126,32 @@ async def _source_lookup(source_message_id: int):
     return rows[0] if isinstance(rows, list) and rows else None
 
 
+async def _duplicate_check(item: dict):
+    return await _rpc(
+        "strima_gateway_duplicate_check_v2",
+        {
+            "p_title": item.get("detected_title") or item.get("file_name") or "",
+            "p_normalized_title": item.get("normalized_title"),
+            "p_year": item.get("detected_year"),
+            "p_file_size_bytes": item.get("file_size_bytes"),
+            "p_duration_seconds": item.get("duration_seconds"),
+            "p_content_kind": item.get("content_kind") or "movie",
+            "p_part_number": item.get("part_number"),
+            "p_season_number": item.get("season_number"),
+            "p_episode_number": item.get("episode_number"),
+        },
+    )
+
+
 async def _register_movie(item: dict, destination_message_id: int):
     public_title = _clean_public_title(item)
     playback_url = f"https://mc-p2ku5nz4qw.bunny.run/movie/{destination_message_id}"
     rows = await _rpc(
-        "strima_gateway_register_movie",
+        "strima_gateway_register_movie_v2",
         {
             "p_admin_key": base.STRIMA_ADMIN_KEY,
             "p_title": public_title,
+            "p_normalized_title": item.get("normalized_title"),
             "p_year": item.get("detected_year"),
             "p_duration_seconds": item.get("duration_seconds"),
             "p_duration_text": item.get("duration_text"),
@@ -136,6 +164,10 @@ async def _register_movie(item: dict, destination_message_id: int):
             "p_file_size_mb": item.get("file_size_mb"),
             "p_description": _description_from_item(item, public_title),
             "p_category_slug": None,
+            "p_content_kind": item.get("content_kind") or "movie",
+            "p_part_number": item.get("part_number"),
+            "p_season_number": item.get("season_number"),
+            "p_episode_number": item.get("episode_number"),
         },
     )
     return rows[0] if isinstance(rows, list) and rows else None
@@ -208,10 +240,11 @@ async def import_one_movie(
                     "item": item,
                 }
 
-            # Content-level duplicate check protects against the same movie existing
-            # under another Telegram source message while allowing sequels/parts.
+            # Canonical duplicate check protects against the same movie existing
+            # under another Telegram source message while preserving sequels,
+            # explicit multipart movies, seasons and episodes.
             stage = "supabase_duplicate_check"
-            matches = await base.supabase_duplicate_rpc(item)
+            matches = await _duplicate_check(item)
             top = matches[0] if isinstance(matches, list) and matches else None
 
             if top and top.get("decision") == "duplicate":
