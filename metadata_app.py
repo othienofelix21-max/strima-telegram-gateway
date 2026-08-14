@@ -84,7 +84,7 @@ def _tmdb_get_sync(path: str, params: Optional[dict] = None):
         headers={
             "Authorization": f"Bearer {TMDB_BEARER_TOKEN}",
             "Accept": "application/json",
-            "User-Agent": "STRIMA-Metadata/1.1",
+            "User-Agent": "STRIMA-Metadata/1.2",
         },
     )
     try:
@@ -231,6 +231,157 @@ async def _tmdb_find_best(query_title: str, expected_year: Optional[int]):
     return combined[0] if combined else (0, None, None)
 
 
+async def _split_family_evidence(source_message_id: int, alias: str) -> dict:
+    """Inspect nearby Telegram source messages for numbered parts of the same title."""
+    evidence = {
+        "distinct_parts": [],
+        "aggregate_minutes": None,
+        "part_durations": {},
+    }
+    if base.SOURCE_INPUT_ENTITY is None or not alias:
+        return evidence
+
+    alias_norm = _normalize_tmdb_title(alias)
+    start_id = max(1, int(source_message_id) - 24)
+    end_id = int(source_message_id) + 24
+    ids = list(range(start_id, end_id + 1))
+    try:
+        messages = await base.client.get_messages(base.SOURCE_INPUT_ENTITY, ids=ids)
+    except Exception:
+        log.exception("Could not inspect nearby split-family messages for source %s", source_message_id)
+        return evidence
+
+    grouped: dict[int, list[int]] = {}
+    for message in messages or []:
+        if not message or not getattr(message, "file", None):
+            continue
+        try:
+            item = base.source_item_from_message(message)
+            public_title = importer._clean_public_title(item)
+            duration_minutes = int(round(int(item["duration_seconds"]) / 60)) if item.get("duration_seconds") else None
+            sibling_alias, sibling_part = _split_part_alias(public_title, duration_minutes)
+            if not sibling_alias or sibling_part is None:
+                continue
+            if _normalize_tmdb_title(sibling_alias) != alias_norm:
+                continue
+            if duration_minutes is None or duration_minutes <= 0:
+                continue
+            grouped.setdefault(int(sibling_part), []).append(int(duration_minutes))
+        except Exception:
+            continue
+
+    representative = {}
+    for part, durations in grouped.items():
+        if not durations:
+            continue
+        durations = sorted(durations)
+        representative[part] = durations[len(durations) // 2]
+
+    parts = sorted(representative)
+    evidence["distinct_parts"] = parts
+    evidence["part_durations"] = {str(k): representative[k] for k in parts}
+    if len(parts) >= 2:
+        evidence["aggregate_minutes"] = sum(representative.values())
+    return evidence
+
+
+async def _tmdb_total_runtime_minutes(kind: str, candidate: dict) -> Optional[int]:
+    candidate_id = candidate.get("id") if isinstance(candidate, dict) else None
+    if not candidate_id or kind not in {"movie", "tv"}:
+        return None
+    try:
+        details = await _tmdb_get(f"/{kind}/{int(candidate_id)}", {"language": TMDB_LANGUAGE})
+    except Exception:
+        log.exception("TMDB runtime lookup failed for %s/%s", kind, candidate_id)
+        return None
+    if not isinstance(details, dict):
+        return None
+
+    if kind == "movie":
+        try:
+            runtime = int(details.get("runtime") or 0)
+        except (TypeError, ValueError):
+            runtime = 0
+        return runtime if runtime > 0 else None
+
+    try:
+        episode_count = int(details.get("number_of_episodes") or 0)
+    except (TypeError, ValueError):
+        episode_count = 0
+
+    runtimes = []
+    for value in details.get("episode_run_time") or []:
+        try:
+            minutes = int(value)
+        except (TypeError, ValueError):
+            continue
+        if minutes > 0:
+            runtimes.append(minutes)
+
+    if not runtimes:
+        for key in ("last_episode_to_air", "next_episode_to_air"):
+            episode = details.get(key) or {}
+            try:
+                minutes = int(episode.get("runtime") or 0)
+            except (TypeError, ValueError):
+                minutes = 0
+            if minutes > 0:
+                runtimes.append(minutes)
+                break
+
+    if episode_count > 0 and runtimes:
+        average_runtime = int(round(sum(runtimes) / len(runtimes)))
+        return episode_count * average_runtime
+    return None
+
+
+async def _tmdb_find_best_split(
+    query_title: str,
+    expected_year: Optional[int],
+    source_message_id: int,
+):
+    """Use sibling-part duration evidence to avoid matching a split title to the wrong adaptation."""
+    movie_candidates, tv_candidates = await asyncio.gather(
+        _tmdb_search_kind("movie", query_title, expected_year),
+        _tmdb_search_kind("tv", query_title, expected_year),
+    )
+    evidence = await _split_family_evidence(source_message_id, query_title)
+    aggregate = evidence.get("aggregate_minutes")
+
+    combined = []
+    for candidate in movie_candidates[:5]:
+        combined.append([_score_tmdb_candidate(query_title, expected_year, candidate), candidate, "movie", None])
+    for candidate in tv_candidates[:5]:
+        combined.append([_score_tmdb_candidate(query_title, expected_year, candidate), candidate, "tv", None])
+
+    if aggregate and len(evidence.get("distinct_parts") or []) >= 2:
+        plausible = [row for row in combined if row[0] >= 55]
+        for row in plausible:
+            runtime = await _tmdb_total_runtime_minutes(row[2], row[1])
+            row[3] = runtime
+            if not runtime:
+                continue
+            diff = abs(int(runtime) - int(aggregate))
+            close_band = max(20, int(aggregate * 0.15))
+            medium_band = max(45, int(aggregate * 0.30))
+            bad_band = max(60, int(aggregate * 0.35))
+            if diff <= close_band:
+                row[0] += 18
+                if row[2] == "tv" and len(evidence.get("distinct_parts") or []) >= 3:
+                    row[0] += 5
+            elif diff <= medium_band:
+                row[0] += 8
+            elif diff >= bad_band:
+                row[0] -= 25
+            row[0] = max(0, min(100, row[0]))
+
+    combined.sort(key=lambda row: row[0], reverse=True)
+    if not combined:
+        return 0, None, None, evidence, None
+    best = combined[0]
+    return best[0], best[1], best[2], evidence, best[3]
+
+
 async def _metadata_target(movie_id: str) -> Optional[dict]:
     rows = await importer._rpc(
         "strima_gateway_metadata_target",
@@ -292,6 +443,7 @@ async def metadata_status(
         "tmdb_configured": bool(TMDB_BEARER_TOKEN),
         "tmdb_searches_movie_and_tv": True,
         "split_part_alias_fallback": True,
+        "split_family_runtime_guard": True,
     }
 
 
@@ -327,6 +479,9 @@ async def enrich_source_movie(
         "candidate_title": None,
         "query_title": None,
         "source_part_number": None,
+        "split_family_parts": [],
+        "split_family_duration_minutes": None,
+        "matched_runtime_minutes": None,
         "reason": "Telegram metadata cleanup only; no external provider is configured.",
     }
 
@@ -345,7 +500,14 @@ async def enrich_source_movie(
                 local_patch.get("duration_minutes") or movie.get("duration_minutes"),
             )
             if alias:
-                alias_score, alias_best, alias_kind = await _tmdb_find_best(alias, expected_year)
+                alias_score, alias_best, alias_kind, family_evidence, matched_runtime = await _tmdb_find_best_split(
+                    alias,
+                    expected_year,
+                    source_message_id,
+                )
+                provider_result["split_family_parts"] = family_evidence.get("distinct_parts") or []
+                provider_result["split_family_duration_minutes"] = family_evidence.get("aggregate_minutes")
+                provider_result["matched_runtime_minutes"] = matched_runtime
                 if alias_score > best_score:
                     best_score, best, best_kind = alias_score, alias_best, alias_kind
                     used_query = alias
@@ -360,7 +522,10 @@ async def enrich_source_movie(
                     patch[key] = value
             reason = "High-confidence title/year match."
             if used_query != requested_title:
-                reason = "High-confidence match using a short-file split-part alias; the STRIMA source title is preserved."
+                if provider_result.get("split_family_duration_minutes"):
+                    reason = "High-confidence split-family match using sibling part durations; the STRIMA source title is preserved."
+                else:
+                    reason = "High-confidence match using a short-file split-part alias; the STRIMA source title is preserved."
             provider_result.update({
                 "matched": True,
                 "confidence": round(best_score / 100.0, 2),
