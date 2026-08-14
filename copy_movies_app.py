@@ -12,8 +12,6 @@ import metadata_hotfix as hotfix
 app = hotfix.app
 log = logging.getLogger("strima-copy-movies")
 
-MOVIE_MAX_SIZE_GB = float(os.getenv("MOVIE_MAX_SIZE_GB", "1.8"))
-MOVIE_MAX_FILE_BYTES = int(MOVIE_MAX_SIZE_GB * 1024 * 1024 * 1024)
 COPY_DELAY_SECONDS = max(0.5, float(os.getenv("MOVIE_COPY_DELAY_SECONDS", "1.5")))
 
 STATE = {
@@ -138,11 +136,10 @@ async def _copy_all_movies_worker():
         STATE["phase"] = "copying"
 
         log.info(
-            "Starting COPY-ONLY movie backfill source=%s destination=%s indexed_destination=%s max_size=%.2fGB",
+            "Starting COPY-ONLY movie backfill source=%s destination=%s indexed_destination=%s size_limit=UNLIMITED",
             base.TG_SOURCE_CHANNEL_ID,
             base.TG_CHANNEL_ID,
             STATE["destination_videos_indexed"],
-            MOVIE_MAX_SIZE_GB,
         )
 
         async for message in base.client.iter_messages(base.SOURCE_INPUT_ENTITY, reverse=True):
@@ -158,10 +155,6 @@ async def _copy_all_movies_worker():
                 continue
 
             STATE["video_candidates"] += 1
-            size_bytes = int(getattr(file_obj, "size", None) or 0)
-            if size_bytes >= MOVIE_MAX_FILE_BYTES:
-                STATE["skipped_too_large"] += 1
-                continue
 
             doc_id = _document_id(message)
             fingerprint = _fallback_fingerprint(message)
@@ -200,10 +193,9 @@ async def _copy_all_movies_worker():
         STATE["completed"] = True
         STATE["current_source_message_id"] = None
         log.info(
-            "COPY-ONLY movie backfill complete copied=%s existing=%s too_large=%s failed=%s",
+            "COPY-ONLY movie backfill complete copied=%s existing=%s failed=%s",
             STATE["copied"],
             STATE["already_in_destination"],
-            STATE["skipped_too_large"],
             STATE["failed"],
         )
     except asyncio.CancelledError:
@@ -257,7 +249,7 @@ async def copy_all_movies_status(
     base.require_admin_key(admin_key)
     return {
         "ok": True,
-        "max_file_size_gb": MOVIE_MAX_SIZE_GB,
+        "size_limit": "unlimited",
         "delay_seconds": COPY_DELAY_SECONDS,
         "task_running": bool(TASK is not None and not TASK.done()),
         **STATE,
