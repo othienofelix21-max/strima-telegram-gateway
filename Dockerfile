@@ -15,7 +15,8 @@ COPY metadata_app.py .
 COPY metadata_hotfix.py .
 COPY archive_sync_app.py .
 COPY copy_movies_app.py .
+COPY register_existing_app.py .
 
 EXPOSE 80
 
-CMD ["sh", "-c", "uvicorn copy_movies_app:app --host 0.0.0.0 --port ${PORT:-80} --workers 1"]
+CMD ["sh", "-c", "uvicorn register_existing_app:app --host 0.0.0.0 --port ${PORT:-80} --workers 1"]
