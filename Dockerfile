@@ -18,7 +18,8 @@ COPY copy_movies_app.py .
 COPY register_existing_app.py .
 COPY series_test_app.py .
 COPY series_auto_app.py .
+COPY series_strict_app.py .
 
 EXPOSE 80
 
-CMD ["sh", "-c", "uvicorn series_auto_app:app --host 0.0.0.0 --port ${PORT:-80} --workers 1"]
+CMD ["sh", "-c", "uvicorn series_strict_app:app --host 0.0.0.0 --port ${PORT:-80} --workers 1"]
