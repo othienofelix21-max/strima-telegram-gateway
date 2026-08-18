@@ -3,7 +3,7 @@ import logging
 import re
 from typing import Optional
 
-from fastapi import Header
+from fastapi import Header, Query
 from telethon.errors import FloodWaitError
 
 import register_existing_app as current
@@ -14,12 +14,7 @@ import metadata_app as metadata
 app = current.app
 log = logging.getLogger("strima-series-worker")
 
-# Generic series worker. These values define only the CURRENT controlled test.
 SERIES_SOURCE_TITLE = "PREMIUM SERIES"
-TEST_SERIES_TITLE = "Jumong"
-TEST_SERIES_SLUG = "jumong"
-TEST_SEASON_NUMBER = 1
-TEST_EPISODES = {1, 2}
 PLAYBACK_BASE = "https://mc-p2ku5nz4qw.bunny.run/movie"
 
 STATE = {
@@ -27,16 +22,21 @@ STATE = {
     "completed": False,
     "phase": "idle",
     "source_channel_id": None,
-    "series_title": TEST_SERIES_TITLE,
-    "season_number": TEST_SEASON_NUMBER,
+    "series_title": None,
+    "series_slug": None,
+    "season_number": None,
     "found": 0,
+    "first_episode": None,
+    "last_episode": None,
     "copied": 0,
     "registered": 0,
     "already_registered": 0,
+    "duplicates_ignored": 0,
     "tmdb_series_enriched": False,
     "tmdb_episodes_enriched": 0,
     "tmdb_matched": False,
     "tmdb_id": None,
+    "tmdb_expected_season_episodes": None,
     "failed": 0,
     "current_episode": None,
     "last_error": None,
@@ -44,13 +44,29 @@ STATE = {
 TASK = None
 
 
-def _episode_number(message):
+def _slugify(text: str) -> str:
+    value = re.sub(r"[^a-z0-9]+", "-", str(text or "").strip().lower()).strip("-")
+    return value or "series"
+
+
+def _episode_number(message, series_title: str):
     file_obj = getattr(message, "file", None)
     name = str(getattr(file_obj, "name", "") or "")
     caption = str(getattr(message, "message", "") or "")
     text = f"{name}\n{caption}"
-    m = re.search(r"\bjumong[\s._-]*0*(\d{1,3})\b", text, flags=re.I)
-    return int(m.group(1)) if m else None
+
+    title_pattern = re.escape(str(series_title or "").strip()).replace(r"\ ", r"[\s._-]+")
+    patterns = [
+        rf"\b{title_pattern}[\s._-]*(?:s\s*0*\d{{1,2}}[\s._-]*)?(?:e|ep|episode)?[\s._-]*0*(\d{{1,3}})\b",
+        rf"\b{title_pattern}[\s._-]+0*(\d{{1,3}})\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            value = int(m.group(1))
+            if 1 <= value <= 500:
+                return value
+    return None
 
 
 async def _resolve_series_source():
@@ -64,22 +80,30 @@ async def _resolve_series_source():
     return matches[0]
 
 
-async def _find_test_episodes(source):
+async def _find_all_episodes(source, series_title: str):
     found = {}
-    async for message in base.client.iter_messages(source.input_entity, search=TEST_SERIES_TITLE):
+    duplicates = 0
+    async for message in base.client.iter_messages(source.input_entity, search=series_title):
         file_obj = getattr(message, "file", None)
         if not base.is_video_file(file_obj, message):
             continue
-        ep = _episode_number(message)
-        if ep in TEST_EPISODES and ep not in found:
-            found[ep] = message
-        if TEST_EPISODES.issubset(found.keys()):
-            break
-    missing = sorted(TEST_EPISODES - set(found.keys()))
-    if missing:
-        raise RuntimeError(f"Missing test episode(s): {missing}")
-    STATE["found"] = len(found)
-    return [found[n] for n in sorted(TEST_EPISODES)]
+        ep = _episode_number(message, series_title)
+        if ep is None:
+            continue
+        if ep in found:
+            duplicates += 1
+            continue
+        found[ep] = message
+
+    if not found:
+        raise RuntimeError(f"No numbered video episodes found for {series_title!r}")
+
+    episode_numbers = sorted(found)
+    STATE["found"] = len(episode_numbers)
+    STATE["first_episode"] = episode_numbers[0]
+    STATE["last_episode"] = episode_numbers[-1]
+    STATE["duplicates_ignored"] = duplicates
+    return [found[n] for n in episode_numbers]
 
 
 async def _episode_lookup(source_channel_id: int, source_message_id: int):
@@ -94,7 +118,15 @@ async def _episode_lookup(source_channel_id: int, source_message_id: int):
     return rows[0] if isinstance(rows, list) and rows else None
 
 
-async def _register_episode(source_channel_id: int, source_message, destination_message, episode_number: int):
+async def _register_episode(
+    source_channel_id: int,
+    source_message,
+    destination_message,
+    episode_number: int,
+    series_title: str,
+    series_slug: str,
+    season_number: int,
+):
     file_obj = source_message.file
     size_bytes = int(getattr(file_obj, "size", 0) or 0)
     duration = getattr(file_obj, "duration", None)
@@ -105,9 +137,9 @@ async def _register_episode(source_channel_id: int, source_message, destination_
         "strima_gateway_register_episode_v1",
         {
             "p_admin_key": base.STRIMA_ADMIN_KEY,
-            "p_series_title": TEST_SERIES_TITLE,
-            "p_series_slug": TEST_SERIES_SLUG,
-            "p_season_number": TEST_SEASON_NUMBER,
+            "p_series_title": series_title,
+            "p_series_slug": series_slug,
+            "p_season_number": season_number,
             "p_episode_number": episode_number,
             "p_episode_title": f"Episode {episode_number}",
             "p_duration_seconds": int(duration) if duration else None,
@@ -118,7 +150,7 @@ async def _register_episode(source_channel_id: int, source_message, destination_
             "p_playback_url": playback_url,
             "p_file_size_mb": round(size_bytes / (1024 * 1024), 2) if size_bytes else None,
             "p_source_filename": filename or None,
-            "p_source_normalized_title": f"{TEST_SERIES_TITLE.lower()} season {TEST_SEASON_NUMBER} episode {episode_number}",
+            "p_source_normalized_title": f"{series_title.lower()} season {season_number} episode {episode_number}",
         },
     )
     return rows[0] if isinstance(rows, list) and rows else None
@@ -133,7 +165,9 @@ async def _copy_message(message):
             formatting_entities=(message.entities or None),
         )
     except FloodWaitError as exc:
-        await asyncio.sleep(int(getattr(exc, "seconds", 0) or 0) + 2)
+        wait_seconds = int(getattr(exc, "seconds", 0) or 0) + 2
+        log.warning("Telegram FloodWait: waiting %ss", wait_seconds)
+        await asyncio.sleep(wait_seconds)
         result = await base.client.send_file(
             base.CHANNEL_INPUT_ENTITY,
             file=message.media,
@@ -147,23 +181,47 @@ async def _copy_message(message):
     return result
 
 
-async def _find_tmdb_tv():
+async def _find_tmdb_tv(series_title: str, season_number: int):
     if metadata.METADATA_PROVIDER != "tmdb" or not metadata.TMDB_BEARER_TOKEN:
-        return None, None
-    candidates = await metadata._tmdb_search_kind("tv", TEST_SERIES_TITLE, None)
+        return None, None, None
+
+    candidates = await metadata._tmdb_search_kind("tv", series_title, None)
     scored = sorted(
-        ((metadata._score_tmdb_candidate(TEST_SERIES_TITLE, None, c), c) for c in candidates),
+        ((metadata._score_tmdb_candidate(series_title, None, c), c) for c in candidates),
         key=lambda row: row[0],
         reverse=True,
     )
     if not scored or scored[0][0] < 70:
-        return None, None
-    score, candidate = scored[0]
-    details = await metadata._tmdb_get(f"/tv/{int(candidate['id'])}", {"language": metadata.TMDB_LANGUAGE})
-    return candidate, details
+        return None, None, None
+
+    _, candidate = scored[0]
+    details = await metadata._tmdb_get(
+        f"/tv/{int(candidate['id'])}",
+        {"language": metadata.TMDB_LANGUAGE},
+    )
+    season_details = None
+    try:
+        season_details = await metadata._tmdb_get(
+            f"/tv/{int(candidate['id'])}/season/{season_number}",
+            {"language": metadata.TMDB_LANGUAGE},
+        )
+        episodes = season_details.get("episodes") if isinstance(season_details, dict) else None
+        if isinstance(episodes, list):
+            STATE["tmdb_expected_season_episodes"] = len(episodes)
+    except Exception:
+        log.exception("TMDB season lookup failed for %s season %s", series_title, season_number)
+
+    return candidate, details, season_details
 
 
-async def _enrich_series_and_episode(registered: dict, episode_number: int, candidate: dict, details: dict):
+async def _enrich_series_and_episode(
+    registered: dict,
+    episode_number: int,
+    candidate: dict,
+    details: dict,
+    season_details: Optional[dict],
+    season_number: int,
+):
     if not candidate or not details:
         return
 
@@ -173,6 +231,10 @@ async def _enrich_series_and_episode(registered: dict, episode_number: int, cand
     first_air = str(details.get("first_air_date") or candidate.get("first_air_date") or "")
     release_year = int(first_air[:4]) if len(first_air) >= 4 and first_air[:4].isdigit() else None
 
+    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
+    banner_url = f"https://image.tmdb.org/t/p/original{backdrop_path}" if backdrop_path else None
+    default_episode_thumbnail = banner_url or poster_url
+
     await importer._rpc(
         "strima_gateway_update_series_metadata_v1",
         {
@@ -180,9 +242,9 @@ async def _enrich_series_and_episode(registered: dict, episode_number: int, cand
             "p_series_id": registered.get("series_id"),
             "p_tmdb_id": int(candidate.get("id")) if candidate.get("id") else None,
             "p_description": str(details.get("overview") or candidate.get("overview") or "").strip() or None,
-            "p_poster_url": f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None,
-            "p_banner_url": f"https://image.tmdb.org/t/p/original{backdrop_path}" if backdrop_path else None,
-            "p_thumbnail_url": f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None,
+            "p_poster_url": poster_url,
+            "p_banner_url": banner_url,
+            "p_thumbnail_url": poster_url or banner_url,
             "p_release_year": release_year,
             "p_country": str(countries[0]) if countries else None,
         },
@@ -191,16 +253,28 @@ async def _enrich_series_and_episode(registered: dict, episode_number: int, cand
     STATE["tmdb_matched"] = True
     STATE["tmdb_id"] = int(candidate.get("id")) if candidate.get("id") else None
 
-    try:
-        ep = await metadata._tmdb_get(
-            f"/tv/{int(candidate['id'])}/season/{TEST_SEASON_NUMBER}/episode/{episode_number}",
-            {"language": metadata.TMDB_LANGUAGE},
-        )
-    except Exception:
-        log.exception("TMDB episode lookup failed for episode %s", episode_number)
-        return
+    episode_metadata = None
+    if isinstance(season_details, dict):
+        episodes = season_details.get("episodes") or []
+        for item in episodes:
+            try:
+                if int(item.get("episode_number")) == int(episode_number):
+                    episode_metadata = item
+                    break
+            except (TypeError, ValueError):
+                continue
 
-    still_path = ep.get("still_path") if isinstance(ep, dict) else None
+    if episode_metadata is None:
+        try:
+            episode_metadata = await metadata._tmdb_get(
+                f"/tv/{int(candidate['id'])}/season/{season_number}/episode/{episode_number}",
+                {"language": metadata.TMDB_LANGUAGE},
+            )
+        except Exception:
+            log.exception("TMDB episode lookup failed for episode %s", episode_number)
+            episode_metadata = {}
+
+    ep = episode_metadata if isinstance(episode_metadata, dict) else {}
     await importer._rpc(
         "strima_gateway_update_episode_metadata_v1",
         {
@@ -208,33 +282,47 @@ async def _enrich_series_and_episode(registered: dict, episode_number: int, cand
             "p_episode_id": registered.get("episode_id"),
             "p_title": str(ep.get("name") or "").strip() or None,
             "p_description": str(ep.get("overview") or "").strip() or None,
-            "p_thumbnail_url": f"https://image.tmdb.org/t/p/w500{still_path}" if still_path else None,
+            # STRIMA default: every episode uses the series banner/poster as its thumbnail.
+            "p_thumbnail_url": default_episode_thumbnail,
             "p_duration_minutes": int(ep.get("runtime")) if ep.get("runtime") else None,
         },
     )
     STATE["tmdb_episodes_enriched"] += 1
 
 
-async def _worker():
+async def _worker(series_title: str, season_number: int):
+    series_title = re.sub(r"\s+", " ", str(series_title or "")).strip()
+    if not series_title:
+        raise RuntimeError("Series title is required")
+    if season_number < 1:
+        raise RuntimeError("Season number must be >= 1")
+    series_slug = _slugify(series_title)
+
     STATE.update({
         "running": True,
         "completed": False,
         "phase": "resolving_source",
         "source_channel_id": None,
-        "series_title": TEST_SERIES_TITLE,
-        "season_number": TEST_SEASON_NUMBER,
+        "series_title": series_title,
+        "series_slug": series_slug,
+        "season_number": season_number,
         "found": 0,
+        "first_episode": None,
+        "last_episode": None,
         "copied": 0,
         "registered": 0,
         "already_registered": 0,
+        "duplicates_ignored": 0,
         "tmdb_series_enriched": False,
         "tmdb_episodes_enriched": 0,
         "tmdb_matched": False,
         "tmdb_id": None,
+        "tmdb_expected_season_episodes": None,
         "failed": 0,
         "current_episode": None,
         "last_error": None,
     })
+
     try:
         if not base.client.is_connected():
             raise RuntimeError("Telegram client is disconnected")
@@ -244,14 +332,15 @@ async def _worker():
         source = await _resolve_series_source()
         source_channel_id = int(source.id)
         STATE["source_channel_id"] = source_channel_id
-        STATE["phase"] = "finding_episodes"
-        messages = await _find_test_episodes(source)
+
+        STATE["phase"] = "finding_all_episodes"
+        messages = await _find_all_episodes(source, series_title)
 
         STATE["phase"] = "tmdb_preflight"
-        tmdb_candidate, tmdb_details = await _find_tmdb_tv()
+        tmdb_candidate, tmdb_details, tmdb_season = await _find_tmdb_tv(series_title, season_number)
 
         for message in messages:
-            ep = _episode_number(message)
+            ep = _episode_number(message, series_title)
             STATE["current_episode"] = ep
             STATE["phase"] = f"episode_{ep}_preflight"
 
@@ -259,7 +348,9 @@ async def _worker():
             if existing:
                 STATE["already_registered"] += 1
                 if tmdb_candidate and tmdb_details:
-                    await _enrich_series_and_episode(existing, ep, tmdb_candidate, tmdb_details)
+                    await _enrich_series_and_episode(
+                        existing, ep, tmdb_candidate, tmdb_details, tmdb_season, season_number
+                    )
                 continue
 
             STATE["phase"] = f"episode_{ep}_copying"
@@ -267,14 +358,24 @@ async def _worker():
             STATE["copied"] += 1
 
             STATE["phase"] = f"episode_{ep}_registering"
-            registered = await _register_episode(source_channel_id, message, destination, ep)
+            registered = await _register_episode(
+                source_channel_id,
+                message,
+                destination,
+                ep,
+                series_title,
+                series_slug,
+                season_number,
+            )
             if not registered:
                 raise RuntimeError(f"Supabase returned no row for episode {ep}")
             STATE["registered"] += 1
 
             if tmdb_candidate and tmdb_details:
                 STATE["phase"] = f"episode_{ep}_tmdb_enrichment"
-                await _enrich_series_and_episode(registered, ep, tmdb_candidate, tmdb_details)
+                await _enrich_series_and_episode(
+                    registered, ep, tmdb_candidate, tmdb_details, tmdb_season, season_number
+                )
 
             await asyncio.sleep(1)
 
@@ -288,11 +389,53 @@ async def _worker():
         STATE["failed"] += 1
         STATE["phase"] = "error"
         STATE["last_error"] = f"{type(exc).__name__}: {str(exc)[:500]}"
-        log.exception("Series worker test failed")
+        log.exception("Series worker failed")
     finally:
         STATE["running"] = False
 
 
+@app.post("/admin/telegram/series/run/start")
+async def start_series_run(
+    series_title: str = Query(..., min_length=1),
+    season_number: int = Query(default=1, ge=1),
+    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
+):
+    global TASK
+    base.require_admin_key(admin_key)
+    if TASK is not None and not TASK.done():
+        return {"ok": True, "started": False, "reason": "A series job is already running", "size_limit": "unlimited", **STATE}
+    TASK = asyncio.create_task(
+        _worker(series_title, season_number),
+        name=f"strima-series-{_slugify(series_title)}-s{season_number}",
+    )
+    return {
+        "ok": True,
+        "started": True,
+        "worker": "STRIMA Series Worker",
+        "requested_series": series_title,
+        "requested_season": season_number,
+        "size_limit": "unlimited",
+    }
+
+
+@app.get("/admin/telegram/series/run/status")
+async def series_run_status(
+    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
+):
+    base.require_admin_key(admin_key)
+    return {
+        "ok": True,
+        "worker": "STRIMA Series Worker",
+        "source_channel": SERIES_SOURCE_TITLE,
+        "size_limit": "unlimited",
+        "episode_thumbnail_default": "series_banner_or_poster",
+        "tmdb_enabled": metadata.METADATA_PROVIDER == "tmdb" and bool(metadata.TMDB_BEARER_TOKEN),
+        "task_running": bool(TASK is not None and not TASK.done()),
+        **STATE,
+    }
+
+
+# Backward-compatible controlled test endpoints kept for the already-proven 2-episode flow.
 @app.post("/admin/telegram/series/test/start")
 async def start_series_test(
     admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
@@ -301,8 +444,8 @@ async def start_series_test(
     base.require_admin_key(admin_key)
     if TASK is not None and not TASK.done():
         return {"ok": True, "started": False, "size_limit": "unlimited", **STATE}
-    TASK = asyncio.create_task(_worker(), name="strima-series-test")
-    return {"ok": True, "started": True, "size_limit": "unlimited", **STATE}
+    TASK = asyncio.create_task(_worker("Jumong", 1), name="strima-series-jumong-s1")
+    return {"ok": True, "started": True, "size_limit": "unlimited", "note": "This endpoint now runs the full Jumong season; use /series/run/start for future titles."}
 
 
 @app.get("/admin/telegram/series/test/status")
@@ -313,8 +456,8 @@ async def series_test_status(
     return {
         "ok": True,
         "worker": "STRIMA Series Worker",
-        "test_series": TEST_SERIES_TITLE,
         "size_limit": "unlimited",
+        "episode_thumbnail_default": "series_banner_or_poster",
         "tmdb_enabled": metadata.METADATA_PROVIDER == "tmdb" and bool(metadata.TMDB_BEARER_TOKEN),
         "task_running": bool(TASK is not None and not TASK.done()),
         **STATE,
