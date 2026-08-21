@@ -20,6 +20,7 @@ COPY series_test_app.py .
 COPY series_auto_app.py .
 COPY series_strict_app.py .
 COPY series_guarded_app.py .
+COPY movie_strict_async_app.py .
 COPY download_app.py .
 
 EXPOSE 80
