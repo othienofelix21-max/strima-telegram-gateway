@@ -5,7 +5,7 @@ from fastapi import Header, Request, Response
 from fastapi.responses import StreamingResponse
 
 import app as base
-import series_guarded_app as guarded
+import movie_strict_async_app as guarded
 
 # Keep all existing STRIMA routes and add a dedicated Telegram file-download route.
 app = guarded.app
