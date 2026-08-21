@@ -77,49 +77,37 @@ async def _build_destination_maps():
     doc_to_message = {}
     fingerprint_to_message = {}
     count = 0
-
     async for message in base.client.iter_messages(base.CHANNEL_INPUT_ENTITY):
         file_obj = getattr(message, "file", None)
         if not base.is_video_file(file_obj, message):
             continue
         count += 1
-
         doc = _document_id(message)
         if doc is not None and doc not in doc_to_message:
             doc_to_message[doc] = int(message.id)
-
         fp = _fingerprint(message)
         if fp is not None and fp not in fingerprint_to_message:
             fingerprint_to_message[fp] = int(message.id)
-
         if count % 500 == 0:
             STATE["destination_videos_indexed"] = count
-
     STATE["destination_videos_indexed"] = count
     return doc_to_message, fingerprint_to_message
 
 
 async def _apply_metadata(source_message_id: int):
     try:
-        result = await hotfix.enrich_source_movie_smart(
-            source_message_id,
-            apply=True,
-            admin_key=base.STRIMA_ADMIN_KEY,
-        )
+        result = await hotfix.enrich_source_movie_smart(source_message_id, apply=True, admin_key=base.STRIMA_ADMIN_KEY)
         if isinstance(result, dict) and result.get("applied"):
             STATE["metadata_applied"] += 1
         else:
             STATE["metadata_failed"] += 1
     except Exception as exc:
         STATE["metadata_failed"] += 1
-        STATE["last_error"] = (
-            f"metadata source {source_message_id}: {type(exc).__name__}: {str(exc)[:250]}"
-        )
+        STATE["last_error"] = f"metadata source {source_message_id}: {type(exc).__name__}: {str(exc)[:250]}"
         log.exception("Metadata enrichment failed for source=%s", source_message_id)
 
 
 async def _tmdb_preflight(item: dict):
-    """Return a high-confidence metadata preview without writing to Supabase."""
     title = importer._clean_public_title(item)
     year = item.get("detected_year")
     try:
@@ -133,9 +121,14 @@ async def _tmdb_preflight(item: dict):
         patch = metadata._tmdb_patch(candidate)
         poster = patch.get("poster_url")
         banner = patch.get("banner_url") or patch.get("thumbnail_url")
-        if not poster or not banner:
-            return {"score": score, "candidate": candidate, "kind": kind, "poster": poster, "banner": banner, "artwork_ok": False}
-        return {"score": score, "candidate": candidate, "kind": kind, "poster": poster, "banner": banner, "artwork_ok": True}
+        return {
+            "score": score,
+            "candidate": candidate,
+            "kind": kind,
+            "poster": poster,
+            "banner": banner,
+            "artwork_ok": bool(poster and banner),
+        }
     except Exception:
         log.exception("TMDB preflight failed for %s", title)
         return None
@@ -150,32 +143,22 @@ async def _scan_strict_movies(limit: int):
         raise RuntimeError("Premium movie destination channel is not resolved")
 
     STRICT_SCAN.update({
-        "ready": [],
-        "requested": int(limit),
-        "scanned": 0,
-        "already_registered": 0,
-        "duplicates_blocked": 0,
-        "unmatched_destination": 0,
-        "missing_filename": 0,
-        "metadata_match_failed": 0,
-        "missing_artwork": 0,
-        "wrong_content_blocked": 0,
+        "ready": [], "requested": int(limit), "scanned": 0, "already_registered": 0,
+        "duplicates_blocked": 0, "unmatched_destination": 0, "missing_filename": 0,
+        "metadata_match_failed": 0, "missing_artwork": 0, "wrong_content_blocked": 0,
         "ready_for_upload": False,
     })
 
     doc_to_message, fingerprint_to_message = await _build_destination_maps()
-
     async for source_message in base.client.iter_messages(base.SOURCE_INPUT_ENTITY):
         if len(STRICT_SCAN["ready"]) >= limit:
             break
         STRICT_SCAN["scanned"] += 1
-
         file_obj = getattr(source_message, "file", None)
         if not base.is_video_file(file_obj, source_message):
             continue
 
         item = base.source_item_from_message(source_message)
-        # Do not let obvious series episodes enter the movie batch.
         if (item.get("content_kind") or "movie") != "movie" or item.get("episode_number"):
             STRICT_SCAN["wrong_content_blocked"] += 1
             continue
@@ -240,25 +223,13 @@ async def _scan_strict_movies(limit: int):
 
 async def _worker(target: int):
     STATE.update({
-        "running": True,
-        "completed": False,
-        "phase": "indexing_destination",
-        "target": int(target),
-        "destination_videos_indexed": 0,
-        "source_messages_scanned": 0,
-        "video_candidates": 0,
-        "registered": 0,
-        "already_registered": 0,
-        "blocked_duplicates": 0,
-        "unmatched_destination": 0,
-        "metadata_applied": 0,
-        "metadata_failed": 0,
-        "failed": 0,
-        "current_source_message_id": None,
-        "last_destination_message_id": None,
+        "running": True, "completed": False, "phase": "indexing_destination", "target": int(target),
+        "destination_videos_indexed": 0, "source_messages_scanned": 0, "video_candidates": 0,
+        "registered": 0, "already_registered": 0, "blocked_duplicates": 0,
+        "unmatched_destination": 0, "metadata_applied": 0, "metadata_failed": 0,
+        "failed": 0, "current_source_message_id": None, "last_destination_message_id": None,
         "last_error": None,
     })
-
     try:
         doc_to_message, fingerprint_to_message = await _build_destination_maps()
         STATE["phase"] = "registering"
@@ -320,19 +291,11 @@ async def _worker(target: int):
 
 
 async def _strict_upload_worker():
-    global STRICT_UPLOAD_TASK
     STATE.update({
-        "running": True,
-        "completed": False,
-        "phase": "strict_upload",
-        "target": len(STRICT_SCAN["ready"]),
-        "registered": 0,
-        "already_registered": 0,
-        "blocked_duplicates": 0,
-        "metadata_applied": 0,
-        "metadata_failed": 0,
-        "failed": 0,
-        "last_error": None,
+        "running": True, "completed": False, "phase": "strict_upload",
+        "target": len(STRICT_SCAN["ready"]), "registered": 0, "already_registered": 0,
+        "blocked_duplicates": 0, "metadata_applied": 0, "metadata_failed": 0,
+        "failed": 0, "last_error": None,
     })
     try:
         for row in list(STRICT_SCAN["ready"]):
@@ -370,10 +333,7 @@ async def _strict_upload_worker():
 
 
 @app.post("/admin/telegram/movies/strict/scan")
-async def strict_movie_scan(
-    limit: int = Query(default=100, ge=1, le=200),
-    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
-):
+async def strict_movie_scan(limit: int = Query(default=100, ge=1, le=200), admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key")):
     base.require_admin_key(admin_key)
     if TASK is not None and not TASK.done():
         raise HTTPException(status_code=409, detail="Another movie registration task is running")
@@ -382,17 +342,13 @@ async def strict_movie_scan(
 
 
 @app.get("/admin/telegram/movies/strict/status")
-async def strict_movie_status(
-    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
-):
+async def strict_movie_status(admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key")):
     base.require_admin_key(admin_key)
     return {"ok": True, "upload_running": bool(STRICT_UPLOAD_TASK is not None and not STRICT_UPLOAD_TASK.done()), **STRICT_SCAN, "upload_state": STATE}
 
 
 @app.post("/admin/telegram/movies/strict/upload/start")
-async def strict_movie_upload_start(
-    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
-):
+async def strict_movie_upload_start(admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key")):
     global STRICT_UPLOAD_TASK
     base.require_admin_key(admin_key)
     if not STRICT_SCAN.get("ready_for_upload") or not STRICT_SCAN.get("ready"):
@@ -404,10 +360,7 @@ async def strict_movie_upload_start(
 
 
 @app.post("/admin/telegram/register-existing/start")
-async def start_register_existing(
-    limit: int = Query(default=50, ge=1, le=200),
-    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
-):
+async def start_register_existing(limit: int = Query(default=50, ge=1, le=200), admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key")):
     global TASK
     base.require_admin_key(admin_key)
     if TASK is not None and not TASK.done():
@@ -417,17 +370,13 @@ async def start_register_existing(
 
 
 @app.get("/admin/telegram/register-existing/status")
-async def register_existing_status(
-    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
-):
+async def register_existing_status(admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key")):
     base.require_admin_key(admin_key)
     return {"ok": True, "task_running": bool(TASK is not None and not TASK.done()), **STATE}
 
 
 @app.post("/admin/telegram/register-existing/stop")
-async def stop_register_existing(
-    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
-):
+async def stop_register_existing(admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key")):
     global TASK
     base.require_admin_key(admin_key)
     if TASK is not None and not TASK.done():
