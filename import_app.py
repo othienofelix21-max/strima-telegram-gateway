@@ -146,8 +146,11 @@ async def _duplicate_check(item: dict):
 async def _register_movie(item: dict, destination_message_id: int):
     public_title = _clean_public_title(item)
     playback_url = f"https://mc-p2ku5nz4qw.bunny.run/movie/{destination_message_id}"
+    download_url = f"https://mc-p2ku5nz4qw.bunny.run/download/{destination_message_id}"
+    download_file_name = str(item.get("file_name") or "").strip() or f"telegram-{destination_message_id}.mp4"
+
     rows = await _rpc(
-        "strima_gateway_register_movie_v2",
+        "strima_gateway_register_movie_v3",
         {
             "p_admin_key": base.STRIMA_ADMIN_KEY,
             "p_title": public_title,
@@ -161,6 +164,8 @@ async def _register_movie(item: dict, destination_message_id: int):
             "p_destination_channel_id": base.TG_CHANNEL_ID,
             "p_destination_message_id": destination_message_id,
             "p_playback_url": playback_url,
+            "p_download_url": download_url,
+            "p_download_file_name": download_file_name,
             "p_file_size_mb": item.get("file_size_mb"),
             "p_description": _description_from_item(item, public_title),
             "p_category_slug": None,
@@ -236,6 +241,7 @@ async def import_one_movie(
                     "source_message_id": source_message_id,
                     "destination_message_id": destination_message_id,
                     "playback_url": f"https://mc-p2ku5nz4qw.bunny.run/movie/{destination_message_id}",
+                    "download_url": f"https://mc-p2ku5nz4qw.bunny.run/download/{destination_message_id}",
                     "movie": movie,
                     "item": item,
                 }
@@ -286,6 +292,7 @@ async def import_one_movie(
                 "destination_channel_id": base.TG_CHANNEL_ID,
                 "destination_message_id": destination_message_id,
                 "playback_url": f"https://mc-p2ku5nz4qw.bunny.run/movie/{destination_message_id}",
+                "download_url": f"https://mc-p2ku5nz4qw.bunny.run/download/{destination_message_id}",
                 "movie": movie,
                 "item": item,
             }
@@ -344,6 +351,7 @@ async def import_movie_batch(
                 "stage": stage,
                 "destination_message_id": result.get("destination_message_id"),
                 "playback_url": result.get("playback_url"),
+                "download_url": result.get("download_url"),
             })
 
         # Be gentle with Telegram while we validate the production pipeline.
