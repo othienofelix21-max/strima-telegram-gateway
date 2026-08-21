@@ -23,6 +23,7 @@ STATE = {
     "tmdb_candidates_checked": 0,
     "tmdb_candidates_rejected": 0,
     "episode_range_rejected": 0,
+    "existing_series_rejected": 0,
     "selected_series": [],
     "current_series": None,
     "completed_series": 0,
@@ -68,6 +69,7 @@ async def _scan_worker(limit: int):
         "tmdb_candidates_checked": 0,
         "tmdb_candidates_rejected": 0,
         "episode_range_rejected": 0,
+        "existing_series_rejected": 0,
         "selected_series": [],
         "current_series": None,
         "completed_series": 0,
@@ -116,13 +118,17 @@ async def _scan_worker(limit: int):
                     continue
                 target["episodes"] = merged
                 target["source_aliases"].add(group["source_title"])
-                target["missing_episode_numbers"] = sorted(merged_eps - target["existing_episode_numbers"])
+                target["missing_episode_numbers"] = sorted(merged_eps)
                 continue
 
             canonical_title = match["canonical_title"]
             slug = series._slugify(canonical_title)
             existing_eps = await auto._existing_episode_numbers(tmdb_id, slug)
-            missing_eps = sorted(source_eps - existing_eps)
+            if existing_eps:
+                STATE["existing_series_rejected"] += 1
+                continue
+
+            missing_eps = sorted(source_eps)
             if not missing_eps:
                 continue
 
@@ -130,7 +136,7 @@ async def _scan_worker(limit: int):
                 **group,
                 **match,
                 "slug": slug,
-                "existing_episode_numbers": existing_eps,
+                "existing_episode_numbers": set(),
                 "missing_episode_numbers": missing_eps,
                 "source_aliases": {group["source_title"]},
                 "tmdb_episode_numbers": allowed_eps,
@@ -147,14 +153,14 @@ async def _scan_worker(limit: int):
                 "season_number": x["season_number"],
                 "tmdb_season_episode_count": len(x["tmdb_episode_numbers"]),
                 "telegram_episode_count": len(x["episodes"]),
-                "already_in_supabase": len(x["existing_episode_numbers"]),
+                "already_in_supabase": 0,
                 "missing_to_upload": len(x["missing_episode_numbers"]),
                 "first_episode": min(x["episodes"]),
                 "last_episode": max(x["episodes"]),
             }
             for x in SELECTED
         ]
-        STATE["ready_for_upload"] = bool(SELECTED)
+        STATE["ready_for_upload"] = len(SELECTED) == limit
         STATE["completed"] = True
         STATE["phase"] = "ready_for_confirmation" if SELECTED else "nothing_to_upload"
     except asyncio.CancelledError:
@@ -222,9 +228,9 @@ async def strict_scan(
     return {
         "ok": True,
         "started": True,
-        "mode": "strict_scan_only",
+        "mode": "strict_scan_only_new_series",
         "batch_limit": limit,
-        "note": "No episodes are copied until /strict/upload/start is called.",
+        "note": "Existing Supabase series are skipped. No episodes are copied until /strict/upload/start is called.",
     }
 
 
@@ -237,7 +243,7 @@ async def strict_upload(
     if _busy():
         return {"ok": True, "started": False, "reason": "Strict series task already running", **STATE}
     if not SELECTED or not STATE.get("ready_for_upload"):
-        return {"ok": False, "started": False, "reason": "Run strict scan and confirm selected titles first."}
+        return {"ok": False, "started": False, "reason": "Run strict scan and confirm the full selected batch first."}
     UPLOAD_TASK = asyncio.create_task(_upload_worker(), name="strima-strict-upload")
     return {"ok": True, "started": True, "worker": "STRIMA Strict Series Batch", "selected_count": len(SELECTED), "size_limit": "unlimited"}
 
@@ -270,6 +276,7 @@ async def strict_status(
         "size_limit": "unlimited",
         "episode_thumbnail_default": "series_banner_or_poster",
         "tmdb_episode_range_validation": True,
+        "new_series_only": True,
         "task_running": _busy(),
         **STATE,
     }
