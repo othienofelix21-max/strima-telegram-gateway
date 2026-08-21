@@ -73,6 +73,18 @@ def _fingerprint(message):
     return (name, size)
 
 
+def _candidate_title(candidate: dict) -> str:
+    return str(candidate.get("title") or candidate.get("name") or "").strip()
+
+
+def _tmdb_artwork(candidate: dict):
+    poster_path = candidate.get("poster_path")
+    backdrop_path = candidate.get("backdrop_path")
+    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
+    banner_url = f"https://image.tmdb.org/t/p/original{backdrop_path}" if backdrop_path else None
+    return poster_url, banner_url
+
+
 async def _build_destination_maps():
     doc_to_message = {}
     fingerprint_to_message = {}
@@ -118,9 +130,7 @@ async def _tmdb_preflight(item: dict):
                 score, candidate, kind = retry_score, retry_candidate, retry_kind
         if not candidate or score < 70:
             return None
-        patch = metadata._tmdb_patch(candidate)
-        poster = patch.get("poster_url")
-        banner = patch.get("banner_url") or patch.get("thumbnail_url")
+        poster, banner = _tmdb_artwork(candidate)
         return {
             "score": score,
             "candidate": candidate,
@@ -209,7 +219,7 @@ async def _scan_strict_movies(limit: int):
             "destination_message_id": destination_message_id,
             "download_file_name": filename,
             "tmdb_id": candidate.get("id"),
-            "tmdb_title": metadata._candidate_title(candidate),
+            "tmdb_title": _candidate_title(candidate),
             "tmdb_score": tmdb.get("score"),
             "poster_url": tmdb.get("poster"),
             "banner_url": tmdb.get("banner"),
