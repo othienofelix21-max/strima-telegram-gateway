@@ -30,6 +30,18 @@ def _norm(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+async def _destination_lookup(destination_message_id: int):
+    rows = await importer._rpc(
+        "strima_gateway_destination_lookup",
+        {
+            "p_admin_key": base.STRIMA_ADMIN_KEY,
+            "p_destination_channel_id": base.TG_CHANNEL_ID,
+            "p_destination_message_id": int(destination_message_id),
+        },
+    )
+    return rows[0] if isinstance(rows, list) and rows else None
+
+
 async def _scan_unique_movies(limit: int):
     if not base.client.is_connected():
         raise RuntimeError("Telegram client is disconnected")
@@ -43,6 +55,7 @@ async def _scan_unique_movies(limit: int):
         "requested": int(limit),
         "scanned": 0,
         "already_registered": 0,
+        "destination_already_registered": 0,
         "duplicates_blocked": 0,
         "unmatched_destination": 0,
         "missing_filename": 0,
@@ -94,6 +107,16 @@ async def _scan_unique_movies(limit: int):
             reg.STRICT_SCAN["unmatched_destination"] += 1
             continue
 
+        destination_message_id = int(destination_message_id)
+
+        # Persistent destination protection. A destination Telegram message can
+        # already belong to a different movie even when this source message is new.
+        # Reject it during preflight so a READY batch contains only rows that can
+        # actually be inserted into Supabase.
+        if await _destination_lookup(destination_message_id):
+            reg.STRICT_SCAN["destination_already_registered"] += 1
+            continue
+
         filename = str(getattr(file_obj, "name", "") or "").strip()
         if not filename:
             reg.STRICT_SCAN["missing_filename"] += 1
@@ -107,7 +130,6 @@ async def _scan_unique_movies(limit: int):
             reg.STRICT_SCAN["missing_artwork"] += 1
             continue
 
-        destination_message_id = int(destination_message_id)
         candidate = tmdb.get("candidate") or {}
         tmdb_id = candidate.get("id")
         tmdb_kind = str(tmdb.get("kind") or "movie")
@@ -207,6 +229,7 @@ async def strict_movie_status_background(
         "ready_count": len(ready),
         "scanned": reg.STRICT_SCAN.get("scanned", 0),
         "already_registered": reg.STRICT_SCAN.get("already_registered", 0),
+        "destination_already_registered": reg.STRICT_SCAN.get("destination_already_registered", 0),
         "duplicates_blocked": reg.STRICT_SCAN.get("duplicates_blocked", 0),
         "unmatched_destination": reg.STRICT_SCAN.get("unmatched_destination", 0),
         "missing_filename": reg.STRICT_SCAN.get("missing_filename", 0),
