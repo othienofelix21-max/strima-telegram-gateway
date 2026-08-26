@@ -1,7 +1,8 @@
+import asyncio
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import Header, Query, Request, Response
+from fastapi import Header, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 import app as base
@@ -9,6 +10,20 @@ import movie_strict_async_app as guarded
 
 # Keep all existing STRIMA routes and add dedicated Telegram download/audit routes.
 app = guarded.app
+
+INVENTORY_TASK = None
+INVENTORY_ERROR = None
+INVENTORY_ITEMS = []
+INVENTORY_STATE = {
+    "running": False,
+    "completed": False,
+    "scanned_messages": 0,
+    "total_channel_videos": 0,
+    "uploaded_to_supabase": 0,
+    "not_uploaded_to_supabase": 0,
+    "movie_like_videos": 0,
+    "episode_like_videos": 0,
+}
 
 
 def _download_filename(message) -> str:
@@ -24,6 +39,109 @@ def _channel_title(message) -> str:
     return base.clean_detected_title(filename, caption) or filename or caption or f"Telegram {message.id}"
 
 
+async def _inventory_worker():
+    global INVENTORY_ERROR, INVENTORY_ITEMS
+    INVENTORY_ERROR = None
+    INVENTORY_ITEMS = []
+    INVENTORY_STATE.update({
+        "running": True,
+        "completed": False,
+        "scanned_messages": 0,
+        "total_channel_videos": 0,
+        "uploaded_to_supabase": 0,
+        "not_uploaded_to_supabase": 0,
+        "movie_like_videos": 0,
+        "episode_like_videos": 0,
+    })
+
+    try:
+        if not base.client.is_connected():
+            raise RuntimeError("Telegram client is disconnected")
+        if base.CHANNEL_INPUT_ENTITY is None:
+            raise RuntimeError("Premium movie destination channel is not resolved")
+
+        _, registered_destination_ids = await guarded._registered_id_sets()
+
+        async for message in base.client.iter_messages(base.CHANNEL_INPUT_ENTITY):
+            INVENTORY_STATE["scanned_messages"] += 1
+            file_obj = getattr(message, "file", None)
+            if not base.is_video_file(file_obj, message):
+                continue
+
+            destination_message_id = int(message.id)
+            uploaded = destination_message_id in registered_destination_ids
+            filename = str(getattr(file_obj, "name", None) or "").strip()
+            title = _channel_title(message)
+            structure = base.detect_content_structure(title or filename)
+            content_kind = str(structure.get("content_kind") or "movie")
+            size_bytes = int(getattr(file_obj, "size", 0) or 0)
+
+            INVENTORY_STATE["total_channel_videos"] += 1
+            if uploaded:
+                INVENTORY_STATE["uploaded_to_supabase"] += 1
+            else:
+                INVENTORY_STATE["not_uploaded_to_supabase"] += 1
+
+            if content_kind == "episode":
+                INVENTORY_STATE["episode_like_videos"] += 1
+            else:
+                INVENTORY_STATE["movie_like_videos"] += 1
+
+            INVENTORY_ITEMS.append({
+                "destination_message_id": destination_message_id,
+                "title": title,
+                "file_name": filename or None,
+                "status": "UPLOADED" if uploaded else "NOT_UPLOADED",
+                "uploaded_to_supabase": uploaded,
+                "content_kind": content_kind,
+                "season_number": structure.get("season_number"),
+                "episode_number": structure.get("episode_number"),
+                "file_size_mb": round(size_bytes / (1024 * 1024), 2) if size_bytes else None,
+            })
+
+        INVENTORY_STATE["completed"] = True
+    except Exception as exc:
+        INVENTORY_ERROR = f"{type(exc).__name__}: {str(exc)[:500]}"
+    finally:
+        INVENTORY_STATE["running"] = False
+
+
+@app.post("/admin/telegram/movies/channel-inventory/start")
+async def movie_channel_inventory_start(
+    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
+):
+    global INVENTORY_TASK
+    base.require_admin_key(admin_key)
+
+    if INVENTORY_TASK is not None and not INVENTORY_TASK.done():
+        return {
+            "ok": True,
+            "started": False,
+            "reason": "Movie inventory audit is already running",
+            **INVENTORY_STATE,
+        }
+
+    INVENTORY_TASK = asyncio.create_task(_inventory_worker(), name="strima-movie-channel-inventory")
+    return {
+        "ok": True,
+        "started": True,
+        "message": "Movie inventory audit started in background. Poll /admin/telegram/movies/channel-inventory/status.",
+    }
+
+
+@app.get("/admin/telegram/movies/channel-inventory/status")
+async def movie_channel_inventory_status(
+    admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
+):
+    base.require_admin_key(admin_key)
+    return {
+        "ok": INVENTORY_ERROR is None,
+        "error": INVENTORY_ERROR,
+        **INVENTORY_STATE,
+        "items_cached": len(INVENTORY_ITEMS),
+    }
+
+
 @app.get("/admin/telegram/movies/channel-inventory")
 async def movie_channel_inventory(
     status: str = Query(default="all", pattern="^(all|uploaded|not_uploaded)$"),
@@ -31,93 +149,39 @@ async def movie_channel_inventory(
     limit: int = Query(default=200, ge=1, le=500),
     admin_key: Optional[str] = Header(default=None, alias="X-STRIMA-Admin-Key"),
 ):
-    """Audit every video in the STRIMA movie destination channel against Supabase.
-
-    status=uploaded returns destination videos already registered in movies.
-    status=not_uploaded returns destination videos not yet registered in movies.
-    status=all returns both. Results are paginated with offset/limit.
-    """
+    """Return cached inventory results without re-scanning Telegram."""
     base.require_admin_key(admin_key)
-    if not base.client.is_connected():
-        raise RuntimeError("Telegram client is disconnected")
-    if base.CHANNEL_INPUT_ENTITY is None:
-        raise RuntimeError("Premium movie destination channel is not resolved")
 
-    _, registered_destination_ids = await guarded._registered_id_sets()
+    if not INVENTORY_STATE["completed"] and not INVENTORY_ITEMS:
+        raise HTTPException(status_code=409, detail="Start the movie inventory audit first")
 
-    total_videos = 0
-    uploaded_count = 0
-    not_uploaded_count = 0
-    movie_like_count = 0
-    episode_like_count = 0
-    filtered_total = 0
-    items = []
+    if status == "uploaded":
+        filtered = [row for row in INVENTORY_ITEMS if row["uploaded_to_supabase"]]
+    elif status == "not_uploaded":
+        filtered = [row for row in INVENTORY_ITEMS if not row["uploaded_to_supabase"]]
+    else:
+        filtered = INVENTORY_ITEMS
 
-    async for message in base.client.iter_messages(base.CHANNEL_INPUT_ENTITY):
-        file_obj = getattr(message, "file", None)
-        if not base.is_video_file(file_obj, message):
-            continue
-
-        total_videos += 1
-        destination_message_id = int(message.id)
-        uploaded = destination_message_id in registered_destination_ids
-        if uploaded:
-            uploaded_count += 1
-        else:
-            not_uploaded_count += 1
-
-        filename = str(getattr(file_obj, "name", None) or "").strip()
-        caption = str(getattr(message, "message", None) or "").strip()
-        title = _channel_title(message)
-        structure = base.detect_content_structure(title or filename)
-        content_kind = str(structure.get("content_kind") or "movie")
-        if content_kind == "episode":
-            episode_like_count += 1
-        else:
-            movie_like_count += 1
-
-        matches_filter = (
-            status == "all"
-            or (status == "uploaded" and uploaded)
-            or (status == "not_uploaded" and not uploaded)
-        )
-        if not matches_filter:
-            continue
-
-        row_index = filtered_total
-        filtered_total += 1
-        if row_index < offset or len(items) >= limit:
-            continue
-
-        size_bytes = int(getattr(file_obj, "size", 0) or 0)
-        items.append({
-            "destination_message_id": destination_message_id,
-            "title": title,
-            "file_name": filename or None,
-            "status": "UPLOADED" if uploaded else "NOT_UPLOADED",
-            "uploaded_to_supabase": uploaded,
-            "content_kind": content_kind,
-            "season_number": structure.get("season_number"),
-            "episode_number": structure.get("episode_number"),
-            "file_size_mb": round(size_bytes / (1024 * 1024), 2) if size_bytes else None,
-        })
-
+    page = filtered[offset: offset + limit]
     return {
-        "ok": True,
+        "ok": INVENTORY_ERROR is None,
+        "error": INVENTORY_ERROR,
         "destination_channel_id": base.TG_CHANNEL_ID,
         "summary": {
-            "total_channel_videos": total_videos,
-            "uploaded_to_supabase": uploaded_count,
-            "not_uploaded_to_supabase": not_uploaded_count,
-            "movie_like_videos": movie_like_count,
-            "episode_like_videos": episode_like_count,
+            "total_channel_videos": INVENTORY_STATE["total_channel_videos"],
+            "uploaded_to_supabase": INVENTORY_STATE["uploaded_to_supabase"],
+            "not_uploaded_to_supabase": INVENTORY_STATE["not_uploaded_to_supabase"],
+            "movie_like_videos": INVENTORY_STATE["movie_like_videos"],
+            "episode_like_videos": INVENTORY_STATE["episode_like_videos"],
         },
+        "running": INVENTORY_STATE["running"],
+        "completed": INVENTORY_STATE["completed"],
         "filter": status,
-        "filtered_total": filtered_total,
+        "filtered_total": len(filtered),
         "offset": offset,
         "limit": limit,
-        "returned": len(items),
-        "items": items,
+        "returned": len(page),
+        "items": page,
     }
 
 
